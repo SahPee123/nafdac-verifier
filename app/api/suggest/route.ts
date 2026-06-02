@@ -1,51 +1,65 @@
 import { NextRequest, NextResponse } from "next/server";
 
-export interface Suggestion {
-  productName: string;
-  nrn: string;
-  activeIngredients: string;
-  applicantName: string;
-  productCategory: string;
-  status: string;
-  form: string;
-  strengths: string;
-}
+async function queryGreenbook(searchTerm: string) {
+  const baseUrl = "https://greenbook.nafdac.gov.ng";
 
-function parseGreenbookTable(html: string): Suggestion[] {
-  const suggestions: Suggestion[] = [];
+  // Step 1: Get CSRF token from homepage
+  const homeRes = await fetch(baseUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+  });
 
-  // Match table rows
-  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+  const html = await homeRes.text();
+  const csrfMatch = html.match(/meta-csrf-token["\s]+content="([^"]+)"/i) ||
+                    html.match(/name="csrf-token"\s+content="([^"]+)"/i) ||
+                    html.match(/csrf[_-]token.*?content="([^"]+)"/i) ||
+                    html.match(/meta-csrf-token:\s*([^\s<]+)/i);
+  const csrfToken = csrfMatch ? csrfMatch[1] : "";
 
-  const rows = html.match(rowRegex) || [];
+  const cookies = homeRes.headers.get("set-cookie") || "";
+  const cookieStr = cookies.split(",").map((c: string) => c.split(";")[0].trim()).join("; ");
 
-  for (const row of rows) {
-    const cells: string[] = [];
-    let cellMatch;
-    const cellRe = new RegExp(cellRegex.source, "gi");
+  // Step 2: Query the products endpoint
+  const params = new URLSearchParams({
+    draw: "1",
+    "columns[0][data]": "ProductName",
+    "columns[0][searchable]": "true",
+    "columns[1][data]": "ActiveIngredients",
+    "columns[1][searchable]": "true",
+    "columns[2][data]": "ProductCategory",
+    "columns[3][data]": "NRN",
+    "columns[3][searchable]": "true",
+    "columns[4][data]": "ApplicantName",
+    "columns[5][data]": "ApprovalDate",
+    "columns[6][data]": "Status",
+    "order[0][column]": "0",
+    "order[0][dir]": "asc",
+    "start": "0",
+    "length": "10",
+    "search[value]": searchTerm,
+    "search[regex]": "false",
+  });
 
-    while ((cellMatch = cellRe.exec(row)) !== null) {
-      const text = cellMatch[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
-      cells.push(text);
-    }
+  const apiRes = await fetch(`${baseUrl}/products?${params.toString()}`, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "application/json, text/javascript, */*; q=0.01",
+      "Accept-Language": "en-US,en;q=0.9",
+      "X-Requested-With": "XMLHttpRequest",
+      "X-CSRF-TOKEN": csrfToken,
+      "Referer": baseUrl,
+      "Cookie": cookieStr,
+    },
+  });
 
-    // Table: ProductName | ActiveIngredients | ProductCategory | ProductCategoryID | Synonym | NRN | Form | ROA | Strengths | ApplicantName | ApprovalDate | Status
-    if (cells.length >= 6 && cells[0] && cells[5]) {
-      suggestions.push({
-        productName: cells[0] || "",
-        activeIngredients: cells[1] || "",
-        productCategory: cells[2] || "",
-        nrn: cells[5] || "",
-        form: cells[6] || "",
-        strengths: cells[8] || "",
-        applicantName: cells[9] || "",
-        status: cells[11] || "Active",
-      });
-    }
+  if (!apiRes.ok) {
+    throw new Error(`API responded with ${apiRes.status}`);
   }
 
-  return suggestions;
+  const json = await apiRes.json();
+  return json.data || json.aaData || [];
 }
 
 export async function GET(req: NextRequest) {
@@ -56,54 +70,28 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // Try searching the Greenbook by product name
-    const url = `https://greenbook.nafdac.gov.ng/products?name=${encodeURIComponent(query.trim())}&limit=10`;
+    const results = await queryGreenbook(query.trim());
 
-    const res = await fetch(url, {
-      headers: {
-        Accept: "application/json, text/html, */*",
-        "User-Agent": "Mozilla/5.0 (compatible; NAFDACVerifier/1.0)",
-        Referer: "https://greenbook.nafdac.gov.ng/",
-        "X-Requested-With": "XMLHttpRequest",
-      },
-      next: { revalidate: 600 }, // cache 10 mins
-    });
-
-    if (!res.ok) {
-      return NextResponse.json({ suggestions: [] });
-    }
-
-    const contentType = res.headers.get("content-type") || "";
-    let suggestions: Suggestion[] = [];
-
-    if (contentType.includes("application/json")) {
-      const json = await res.json();
-      const items = Array.isArray(json) ? json : json.data || json.products || [];
-      suggestions = items.slice(0, 10).map((item: Record<string, string>) => ({
-        productName: item["Product Name"] || item.productName || item.name || "",
-        nrn: item["NRN"] || item.nrn || "",
-        activeIngredients: item["Active Ingredients"] || item.activeIngredients || "",
-        applicantName: item["Applicant Name"] || item.applicantName || "",
-        productCategory: item["Product Category"] || item.productCategory || "",
-        status: item["Status"] || item.status || "Active",
-        form: item["Form"] || item.form || "",
-        strengths: item["Strengths"] || item.strengths || "",
-      }));
-    } else {
-      const html = await res.text();
-      suggestions = parseGreenbookTable(html).slice(0, 10);
-    }
-
-    // Filter out empty product names and deduplicate
     const seen = new Set<string>();
-    const unique = suggestions.filter((s) => {
-      const key = s.productName.toLowerCase();
-      if (!s.productName || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const suggestions = results
+      .map((item: Record<string, string>) => ({
+        productName: item.ProductName || item.productName || "",
+        nrn: item.NRN || item.nrn || "",
+        activeIngredients: item.ActiveIngredients || item.activeIngredients || "",
+        applicantName: item.ApplicantName || item.applicantName || "",
+        productCategory: item.ProductCategory || item.productCategory || "",
+        status: item.Status || item.status || "Active",
+        form: item.Form || item.form || "",
+        strengths: item.Strengths || item.strengths || "",
+      }))
+      .filter((s: { productName: string }) => {
+        const key = s.productName.toLowerCase();
+        if (!s.productName || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
-    return NextResponse.json({ suggestions: unique });
+    return NextResponse.json({ suggestions });
   } catch (error) {
     console.error("Suggest error:", error);
     return NextResponse.json({ suggestions: [] });
